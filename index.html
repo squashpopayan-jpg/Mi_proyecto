@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<link rel="manifest" href="manifest.json">
+<title>Detector de Mano</title>
+<style>
+  :root { --bg:#111827; --fg:#f9fafb; --muted:#9ca3af; --card:#1f2937; --accent:#22d3ee; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui, sans-serif;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px; }
+  h1 { font-size:1.3rem; margin:4px 0 12px; }
+  #stage { position:relative; width:100%; max-width:640px; aspect-ratio:3/4; background:#000;
+           border-radius:16px; overflow:hidden; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .mirror { transform:scaleX(-1); }
+  #gesture { position:absolute; left:0; right:0; bottom:0; padding:12px; text-align:center;
+             font-size:1.6rem; font-weight:700; background:linear-gradient(transparent, rgba(0,0,0,.75)); }
+  #panel { width:100%; max-width:640px; margin-top:12px; display:grid; gap:8px; }
+  .row { display:flex; gap:8px; }
+  button { flex:1; padding:14px; font-size:1rem; border:0; border-radius:12px;
+           background:var(--accent); color:#000; font-weight:700; }
+  button.secondary { background:var(--card); color:var(--fg); }
+  #fingers { display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+  .finger { background:var(--card); border-radius:10px; padding:8px 4px; text-align:center; font-size:.8rem; }
+  .finger b { display:block; font-size:1.1rem; margin-top:2px; }
+  #status, #motion { color:var(--muted); font-size:.9rem; text-align:center; }
+</style>
+</head>
+<body>
+<h1>✋ Detector de Mano</h1>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="gesture">Pulsa “Iniciar cámara”</div>
+</div>
+<div id="panel">
+  <div class="row">
+    <button id="start">Iniciar cámara</button>
+    <button id="flip" class="secondary">Cambiar cámara</button>
+  </div>
+  <div id="fingers"></div>
+  <div id="motion">Movimiento: —</div>
+  <div id="status">Cargando modelo…</div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const FINGERS = [
+  { name: "Pulgar",  color: "#f87171", pts: [1, 2, 3, 4] },
+  { name: "Índice",  color: "#fbbf24", pts: [5, 6, 7, 8] },
+  { name: "Medio",   color: "#34d399", pts: [9, 10, 11, 12] },
+  { name: "Anular",  color: "#60a5fa", pts: [13, 14, 15, 16] },
+  { name: "Meñique", color: "#c084fc", pts: [17, 18, 19, 20] },
+];
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const gestureEl = document.getElementById("gesture");
+const statusEl = document.getElementById("status");
+const motionEl = document.getElementById("motion");
+const fingersEl = document.getElementById("fingers");
+
+fingersEl.innerHTML = FINGERS.map((f, i) =>
+  `<div class="finger" style="border-top:4px solid ${f.color}">${f.name}<b id="f${i}">—</b></div>`).join("");
+
+let landmarker, stream, facing = "user", running = false, lastTime = -1;
+const trail = []; // historial de la muñeca para detectar deslizamientos
+let lastSwipeAt = 0;
+
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numHands: 2,
+  });
+  statusEl.textContent = "Modelo listo";
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  const mirror = facing === "user";
+  video.classList.toggle("mirror", mirror);
+  canvas.classList.toggle("mirror", mirror);
+  if (!running) { running = true; requestAnimationFrame(loop); }
+}
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z - b.z));
+
+// Devuelve [pulgar, índice, medio, anular, meñique] => true si está extendido
+function extendedFingers(lm) {
+  const wrist = lm[0];
+  const thumb = dist(lm[4], lm[17]) > dist(lm[3], lm[17]) && dist(lm[4], lm[5]) > dist(lm[2], lm[5]) * 0.9;
+  const others = [[8, 6], [12, 10], [16, 14], [20, 18]].map(([tip, pip]) =>
+    dist(lm[tip], wrist) > dist(lm[pip], wrist) * 1.1);
+  return [thumb, ...others];
+}
+
+function classify(lm, ext) {
+  const [t, i, m, r, p] = ext;
+  const count = ext.filter(Boolean).length;
+  const handSize = dist(lm[0], lm[9]);
+  if (dist(lm[4], lm[8]) < handSize * 0.3 && m && r && p) return "👌 OK";
+  if (count === 0) return "✊ Puño";
+  if (count === 5) return "🖐️ Mano abierta";
+  if (t && !i && !m && !r && !p) return lm[4].y < lm[0].y ? "👍 Pulgar arriba" : "👎 Pulgar abajo";
+  if (i && !m && !r && !p) return "☝️ Señalando";
+  if (i && m && !r && !p) return "✌️ Paz";
+  if (i && !m && !r && p) return t ? "🤟 Te quiero" : "🤘 Rock";
+  if (t && !i && !m && !r && p) return "🤙 Llámame";
+  if (i && m && r && !p) return "3️⃣ Tres";
+  return `${count} dedo${count === 1 ? "" : "s"}`;
+}
+
+function detectSwipe(lm, now) {
+  const mirror = facing === "user";
+  trail.push({ x: mirror ? 1 - lm[0].x : lm[0].x, y: lm[0].y, t: now });
+  while (trail.length && now - trail[0].t > 400) trail.shift();
+  if (trail.length < 4 || now - lastSwipeAt < 700) return;
+  const dx = trail.at(-1).x - trail[0].x, dy = trail.at(-1).y - trail[0].y;
+  let dir = null;
+  if (Math.abs(dx) > 0.25 && Math.abs(dx) > Math.abs(dy)) dir = dx > 0 ? "➡️ Derecha" : "⬅️ Izquierda";
+  else if (Math.abs(dy) > 0.25) dir = dy > 0 ? "⬇️ Abajo" : "⬆️ Arriba";
+  if (dir) {
+    motionEl.textContent = `Movimiento: deslizar ${dir}`;
+    lastSwipeAt = now; trail.length = 0;
+    navigator.vibrate?.(40);
+  }
+}
+
+function draw(hands) {
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const W = canvas.width, H = canvas.height;
+  for (const lm of hands) {
+    const P = k => [lm[k].x * W, lm[k].y * H];
+    ctx.lineWidth = 4; ctx.strokeStyle = "#e5e7eb";
+    ctx.beginPath(); // palma
+    for (const k of [0, 1, 5, 9, 13, 17, 0]) ctx.lineTo(...P(k));
+    ctx.stroke();
+    for (const f of FINGERS) {
+      ctx.strokeStyle = f.color; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(...P(f.pts[0] === 1 ? 1 : f.pts[0]));
+      for (const k of f.pts) ctx.lineTo(...P(k));
+      ctx.stroke();
+      for (const k of f.pts) {
+        ctx.fillStyle = f.color; ctx.beginPath();
+        ctx.arc(...P(k), k === f.pts[3] ? 9 : 5, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(...P(0), 7, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function loop() {
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastTime) {
+    lastTime = video.currentTime;
+    const now = performance.now();
+    const res = landmarker.detectForVideo(video, now);
+    draw(res.landmarks);
+    if (res.landmarks.length) {
+      const lm = res.landmarks[0];
+      const ext = extendedFingers(lm);
+      ext.forEach((e, i) => document.getElementById("f" + i).textContent = e ? "Arriba" : "Abajo");
+      gestureEl.textContent = res.landmarks.map(l => classify(l, extendedFingers(l))).join("  ·  ");
+      detectSwipe(lm, now);
+    } else {
+      gestureEl.textContent = "Muestra tu mano a la cámara";
+      FINGERS.forEach((_, i) => document.getElementById("f" + i).textContent = "—");
+      trail.length = 0;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+const modelReady = loadModel().catch(e => { statusEl.textContent = "Error cargando el modelo: " + e.message; });
+
+document.getElementById("start").onclick = async () => {
+  try {
+    statusEl.textContent = "Abriendo cámara…";
+    await modelReady;
+    await startCamera();
+    statusEl.textContent = "Detectando…";
+  } catch (e) { statusEl.textContent = "No se pudo abrir la cámara: " + e.message; }
+};
+document.getElementById("flip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  if (stream) await startCamera().catch(e => statusEl.textContent = e.message);
+};
+</script>
+</body>
+</html>
