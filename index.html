@@ -7,11 +7,15 @@
 <link rel="manifest" href="manifest.json">
 <title>Detector de Mano</title>
 <style>
-  :root { --bg:#111827; --fg:#f9fafb; --muted:#9ca3af; --card:#1f2937; --accent:#22d3ee; }
+  :root { --bg:#111827; --fg:#f9fafb; --muted:#9ca3af; --card:#1f2937; --accent:#22d3ee;
+          --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui, sans-serif;
          display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px; }
   h1 { font-size:1.3rem; margin:4px 0 12px; }
+  #tabs { display:flex; gap:6px; width:100%; max-width:640px; margin-bottom:10px; }
+  #tabs button { background:var(--card); color:var(--fg); }
+  #tabs button.active { background:var(--accent); color:#000; }
   #stage { position:relative; width:100%; max-width:640px; aspect-ratio:3/4; background:#000;
            border-radius:16px; overflow:hidden; }
   video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
@@ -27,10 +31,21 @@
   .finger { background:var(--card); border-radius:10px; padding:8px 4px; text-align:center; font-size:.8rem; }
   .finger b { display:block; font-size:1.1rem; margin-top:2px; }
   #status, #motion { color:var(--muted); font-size:.9rem; text-align:center; }
+  .check { background:var(--card); border-radius:12px; padding:10px 12px; border-left:6px solid var(--muted); }
+  .check.ok { border-color:var(--ok); } .check.warn { border-color:var(--warn); } .check.bad { border-color:var(--bad); }
+  .check .head { display:flex; justify-content:space-between; font-weight:700; }
+  .check .tip { color:var(--muted); font-size:.88rem; margin-top:4px; }
+  #score { text-align:center; font-size:1.1rem; font-weight:700; }
+  .help { color:var(--muted); font-size:.85rem; line-height:1.4; }
+  [hidden] { display:none !important; }
 </style>
 </head>
 <body>
 <h1>✋ Detector de Mano</h1>
+<div id="tabs">
+  <button data-mode="gestos" class="active">Gestos</button>
+  <button data-mode="agarre">🎾 Agarre raqueta</button>
+</div>
 <div id="stage">
   <video id="video" playsinline muted></video>
   <canvas id="canvas"></canvas>
@@ -41,8 +56,23 @@
     <button id="start">Iniciar cámara</button>
     <button id="flip" class="secondary">Cambiar cámara</button>
   </div>
-  <div id="fingers"></div>
-  <div id="motion">Movimiento: —</div>
+
+  <section id="modeGestos">
+    <div id="fingers"></div>
+    <div id="motion">Movimiento: —</div>
+  </section>
+
+  <section id="modeAgarre" hidden>
+    <div class="row" style="margin-bottom:8px">
+      <button id="freeze" class="secondary">⏸ Congelar</button>
+    </div>
+    <div id="score">Agarra la raqueta y muestra la mano a la cámara</div>
+    <div id="checks" style="display:grid; gap:8px; margin-top:8px"></div>
+    <p class="help">Cómo usarlo: sostén la raqueta como si fueras a golpear, con la cara de la raqueta
+      hacia el lado y el dorso de la mano mirando a la cámara (o de lado). Funciona mejor con buena luz
+      y la mano completa en pantalla. La app analiza la posición de tus dedos; no ve la raqueta en sí.</p>
+  </section>
+
   <div id="status">Cargando modelo…</div>
 </div>
 
@@ -57,18 +87,15 @@ const FINGERS = [
   { name: "Meñique", color: "#c084fc", pts: [17, 18, 19, 20] },
 ];
 
-const video = document.getElementById("video");
-const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
-const gestureEl = document.getElementById("gesture");
-const statusEl = document.getElementById("status");
-const motionEl = document.getElementById("motion");
-const fingersEl = document.getElementById("fingers");
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const gestureEl = $("gesture"), statusEl = $("status"), motionEl = $("motion");
 
-fingersEl.innerHTML = FINGERS.map((f, i) =>
+$("fingers").innerHTML = FINGERS.map((f, i) =>
   `<div class="finger" style="border-top:4px solid ${f.color}">${f.name}<b id="f${i}">—</b></div>`).join("");
 
 let landmarker, stream, facing = "user", running = false, lastTime = -1;
+let mode = "gestos", frozen = false;
 const trail = []; // historial de la muñeca para detectar deslizamientos
 let lastSwipeAt = 0;
 
@@ -99,7 +126,16 @@ async function startCamera() {
   if (!running) { running = true; requestAnimationFrame(loop); }
 }
 
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z - b.z));
+const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
+const len = v => Math.hypot(v.x, v.y, v.z);
+const dist = (a, b) => len(sub(a, b));
+// Ángulo en grados entre dos vectores
+const angle = (u, v) => Math.acos(Math.max(-1, Math.min(1,
+  (u.x * v.x + u.y * v.y + u.z * v.z) / (len(u) * len(v) || 1)))) * 180 / Math.PI;
+// Cuánto se dobla un dedo en la articulación b (0° = recto)
+const bend = (lm, a, b, c) => angle(sub(lm[b], lm[a]), sub(lm[c], lm[b]));
+
+// ---------- Modo gestos ----------
 
 // Devuelve [pulgar, índice, medio, anular, meñique] => true si está extendido
 function extendedFingers(lm) {
@@ -142,6 +178,101 @@ function detectSwipe(lm, now) {
   }
 }
 
+function updateGestures(res, now) {
+  if (res.landmarks.length) {
+    const lm = res.landmarks[0];
+    extendedFingers(lm).forEach((e, i) => $("f" + i).textContent = e ? "Arriba" : "Abajo");
+    gestureEl.textContent = res.landmarks.map(l => classify(l, extendedFingers(l))).join("  ·  ");
+    detectSwipe(lm, now);
+  } else {
+    gestureEl.textContent = "Muestra tu mano a la cámara";
+    FINGERS.forEach((_, i) => $("f" + i).textContent = "—");
+    trail.length = 0;
+  }
+}
+
+// ---------- Modo agarre de raqueta (squash) ----------
+
+// Mide la mano en coordenadas 3D reales (metros), así no depende de la distancia a la cámara.
+function gripMetrics(w) {
+  const palmWidth = dist(w[5], w[17]);
+  return {
+    // Separación entre índice y medio: el "dedo gatillo"
+    trigger: angle(sub(w[6], w[5]), sub(w[10], w[9])),
+    // Qué tan cerca queda la punta del pulgar de índice/medio (envuelve el mango)
+    thumb: Math.min(...[6, 7, 10, 11].map(k => dist(w[4], w[k]))) / palmWidth,
+    // Flexión media de medio, anular y meñique (dedos alrededor del mango)
+    wrap: (bend(w, 9, 10, 11) + bend(w, 13, 14, 15) + bend(w, 17, 18, 19)) / 3
+        + (bend(w, 0, 9, 10) + bend(w, 0, 13, 14) + bend(w, 0, 17, 18)) / 3,
+    // Separación entre medio y meñique (dedos repartidos, no amontonados)
+    spread: angle(sub(w[10], w[9]), sub(w[18], w[17])),
+  };
+}
+
+const history = [];
+function smooth(m) {
+  history.push(m);
+  if (history.length > 15) history.shift();
+  const avg = {};
+  for (const k in m) avg[k] = history.reduce((s, h) => s + h[k], 0) / history.length;
+  return avg;
+}
+
+function evaluate(m) {
+  const checks = [];
+  checks.push(m.trigger >= 18
+    ? { level: "ok", title: "Dedo índice en gatillo", val: `${m.trigger.toFixed(0)}°`,
+        tip: "Bien: el índice está separado del medio, como apretando un gatillo. Da control a la cara de la raqueta." }
+    : m.trigger >= 10
+    ? { level: "warn", title: "Dedo índice en gatillo", val: `${m.trigger.toFixed(0)}°`,
+        tip: "Separa un poco más el índice del medio y súbelo por el mango, como un gatillo." }
+    : { level: "bad", title: "Dedo índice en gatillo", val: `${m.trigger.toFixed(0)}°`,
+        tip: "Índice pegado al medio (agarre de martillo/puño). Sepáralo y adelántalo por el mango." });
+
+  checks.push(m.thumb <= 0.55
+    ? { level: "ok", title: "Pulgar envolviendo el mango", val: m.thumb.toFixed(2),
+        tip: "Bien: el pulgar rodea el mango y descansa cerca del índice/medio, formando la “V”." }
+    : m.thumb <= 0.85
+    ? { level: "warn", title: "Pulgar envolviendo el mango", val: m.thumb.toFixed(2),
+        tip: "Acerca la punta del pulgar al dedo medio, rodeando el mango." }
+    : { level: "bad", title: "Pulgar envolviendo el mango", val: m.thumb.toFixed(2),
+        tip: "Pulgar estirado a lo largo del mango. Envuélvelo alrededor para formar la “V” con el índice." });
+
+  checks.push(m.wrap >= 90 && m.wrap <= 200
+    ? { level: "ok", title: "Dedos alrededor del mango", val: `${m.wrap.toFixed(0)}°`,
+        tip: "Bien: medio, anular y meñique rodean el mango sin cerrar el puño." }
+    : m.wrap < 90
+    ? { level: m.wrap < 60 ? "bad" : "warn", title: "Dedos alrededor del mango", val: `${m.wrap.toFixed(0)}°`,
+        tip: "Dedos muy rectos: cierra la mano sobre el mango." }
+    : { level: "warn", title: "Dedos alrededor del mango", val: `${m.wrap.toFixed(0)}°`,
+        tip: "Mano muy cerrada: el agarre puede estar muy apretado. Relájalo, sostén con los dedos y no con la palma." });
+
+  checks.push(m.spread >= 8
+    ? { level: "ok", title: "Dedos repartidos en el mango", val: `${m.spread.toFixed(0)}°`,
+        tip: "Bien: los dedos están algo separados, más control y menos tensión." }
+    : { level: "warn", title: "Dedos repartidos en el mango", val: `${m.spread.toFixed(0)}°`,
+        tip: "Dedos muy juntos. Repártelos un poco a lo largo del mango." });
+  return checks;
+}
+
+function renderGrip(res) {
+  if (!res.worldLandmarks?.length) {
+    history.length = 0;
+    gestureEl.textContent = "Muestra la mano con la raqueta";
+    return;
+  }
+  const checks = evaluate(smooth(gripMetrics(res.worldLandmarks[0])));
+  const pts = checks.reduce((s, c) => s + (c.level === "ok" ? 1 : c.level === "warn" ? 0.5 : 0), 0);
+  const pct = Math.round(pts / checks.length * 100);
+  gestureEl.textContent = pct >= 85 ? `✅ Buen agarre (${pct}%)` : pct >= 55 ? `🟡 Casi (${pct}%)` : `❌ Corrige el agarre (${pct}%)`;
+  $("score").textContent = `Puntuación del agarre: ${pct}%`;
+  $("checks").innerHTML = checks.map(c =>
+    `<div class="check ${c.level}"><div class="head"><span>${c.title}</span><span>${c.val}</span></div>
+     <div class="tip">${c.tip}</div></div>`).join("");
+}
+
+// ---------- Dibujo y bucle ----------
+
 function draw(hands) {
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -154,7 +285,7 @@ function draw(hands) {
     ctx.stroke();
     for (const f of FINGERS) {
       ctx.strokeStyle = f.color; ctx.lineWidth = 5;
-      ctx.beginPath(); ctx.moveTo(...P(f.pts[0] === 1 ? 1 : f.pts[0]));
+      ctx.beginPath(); ctx.moveTo(...P(f.pts[0]));
       for (const k of f.pts) ctx.lineTo(...P(k));
       ctx.stroke();
       for (const k of f.pts) {
@@ -167,29 +298,19 @@ function draw(hands) {
 }
 
 function loop() {
-  if (landmarker && video.readyState >= 2 && video.currentTime !== lastTime) {
+  if (!frozen && landmarker && video.readyState >= 2 && video.currentTime !== lastTime) {
     lastTime = video.currentTime;
     const now = performance.now();
     const res = landmarker.detectForVideo(video, now);
     draw(res.landmarks);
-    if (res.landmarks.length) {
-      const lm = res.landmarks[0];
-      const ext = extendedFingers(lm);
-      ext.forEach((e, i) => document.getElementById("f" + i).textContent = e ? "Arriba" : "Abajo");
-      gestureEl.textContent = res.landmarks.map(l => classify(l, extendedFingers(l))).join("  ·  ");
-      detectSwipe(lm, now);
-    } else {
-      gestureEl.textContent = "Muestra tu mano a la cámara";
-      FINGERS.forEach((_, i) => document.getElementById("f" + i).textContent = "—");
-      trail.length = 0;
-    }
+    if (mode === "gestos") updateGestures(res, now); else renderGrip(res);
   }
   requestAnimationFrame(loop);
 }
 
 const modelReady = loadModel().catch(e => { statusEl.textContent = "Error cargando el modelo: " + e.message; });
 
-document.getElementById("start").onclick = async () => {
+$("start").onclick = async () => {
   try {
     statusEl.textContent = "Abriendo cámara…";
     await modelReady;
@@ -197,10 +318,23 @@ document.getElementById("start").onclick = async () => {
     statusEl.textContent = "Detectando…";
   } catch (e) { statusEl.textContent = "No se pudo abrir la cámara: " + e.message; }
 };
-document.getElementById("flip").onclick = async () => {
+$("flip").onclick = async () => {
   facing = facing === "user" ? "environment" : "user";
   if (stream) await startCamera().catch(e => statusEl.textContent = e.message);
 };
+$("freeze").onclick = () => {
+  frozen = !frozen;
+  frozen ? video.pause() : video.play();
+  $("freeze").textContent = frozen ? "▶️ Continuar" : "⏸ Congelar";
+};
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
+  mode = b.dataset.mode;
+  document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("active", x === b));
+  $("modeGestos").hidden = mode !== "gestos";
+  $("modeAgarre").hidden = mode !== "agarre";
+  history.length = 0;
+  gestureEl.textContent = mode === "gestos" ? "Muestra tu mano a la cámara" : "Muestra la mano con la raqueta";
+});
 </script>
 </body>
 </html>
