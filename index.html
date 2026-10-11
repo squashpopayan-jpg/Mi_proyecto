@@ -38,13 +38,29 @@
   #score { text-align:center; font-size:1.1rem; font-weight:700; }
   .help { color:var(--muted); font-size:.85rem; line-height:1.4; }
   [hidden] { display:none !important; }
+  .stack { display:grid; gap:8px; }
+  #modeSenas .row button.active { background:var(--accent); color:#000; }
+  #modeSenas button { padding:10px 8px; font-size:.9rem; }
+  .card { background:var(--card); border-radius:12px; padding:10px 12px; }
+  .center { text-align:center; } .strong { font-weight:700; } .grow { flex:1; align-self:center; }
+  .item button { flex:0 0 auto; }
+  .big-letter { font-size:4rem; font-weight:800; line-height:1; }
+  .big-text { font-size:1.6rem; font-weight:700; min-height:3rem; }
+  .bar { height:14px; background:var(--card); border-radius:7px; overflow:hidden; }
+  #barFill { height:100%; width:0; transition:width .15s; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { flex:0 0 auto; padding:8px 12px; }
+  .chip.letra { background:var(--card); color:var(--fg); }
+  input[type=text], #senaNombre { flex:1; padding:12px; border-radius:12px; border:0; font-size:1rem; background:var(--card); color:var(--fg); }
+  label { flex:1; color:var(--fg); }
 </style>
 </head>
 <body>
 <h1>✋ Detector de Mano</h1>
 <div id="tabs">
   <button data-mode="gestos" class="active">Gestos</button>
-  <button data-mode="agarre">🎾 Agarre raqueta</button>
+  <button data-mode="agarre">🎾 Agarre</button>
+  <button data-mode="senas">🤟 Señas</button>
 </div>
 <div id="stage">
   <video id="video" playsinline muted></video>
@@ -73,11 +89,14 @@
       y la mano completa en pantalla. La app analiza la posición de tus dedos; no ve la raqueta en sí.</p>
   </section>
 
+  <section id="modeSenas" hidden></section>
+
   <div id="status">Cargando modelo…</div>
 </div>
 
 <script type="module">
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { initSenas } from "./senas.js";
 
 const FINGERS = [
   { name: "Pulgar",  color: "#f87171", pts: [1, 2, 3, 4] },
@@ -303,10 +322,14 @@ function loop() {
     const now = performance.now();
     const res = landmarker.detectForVideo(video, now);
     draw(res.landmarks);
-    if (mode === "gestos") updateGestures(res, now); else renderGrip(res);
+    if (mode === "gestos") updateGestures(res, now);
+    else if (mode === "agarre") renderGrip(res);
+    else senas.onFrame(res, now);
   }
   requestAnimationFrame(loop);
 }
+
+const senas = initSenas({ root: $("modeSenas"), overlay: gestureEl, isMirror: () => facing === "user" });
 
 const modelReady = loadModel().catch(e => { statusEl.textContent = "Error cargando el modelo: " + e.message; });
 
@@ -332,8 +355,10 @@ document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("active", x === b));
   $("modeGestos").hidden = mode !== "gestos";
   $("modeAgarre").hidden = mode !== "agarre";
+  $("modeSenas").hidden = mode !== "senas";
   history.length = 0;
-  gestureEl.textContent = mode === "gestos" ? "Muestra tu mano a la cámara" : "Muestra la mano con la raqueta";
+  if (frozen) $("freeze").click();
+  gestureEl.textContent = { gestos: "Muestra tu mano a la cámara", agarre: "Muestra la mano con la raqueta", senas: "Muestra tu mano" }[mode];
 });
 </script>
 </body>
